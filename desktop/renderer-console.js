@@ -16,9 +16,12 @@
 //      in every shipped build it was off.
 //   2. The handler read Electron's PRE-36 `console-message` signature,
 //      `(event, level, message)`. Electron 36 replaced it with
-//      `(event, details)`. On the bundled Electron 42 the third argument
-//      is undefined, so even with the flag on, the prefix test compared
-//      the string "undefined" and matched nothing.
+//      `(event, details)`, Electron 42 deprecated positional
+//      `(details, level, message, line, sourceId)` in favour of a single
+//      `Event<WebContentsConsoleMessageEventParams>` with `{level, message}`
+//      inside it — using the old positional args now emits
+//      "(electron) 'console-message' arguments are deprecated". The shim
+//      below handles all three shapes so the mirror never goes dark again.
 //
 // The cost was not theoretical. The renderer reports its failures with
 // console.warn / console.error — a recovery that could not be promoted,
@@ -105,25 +108,38 @@ const STRING_LEVELS = Object.freeze({
 });
 
 /**
- * Normalise either `console-message` signature into `{level, message}`.
+ * Normalise every `console-message` signature into `{level, message}`.
  *
  * Electron <36:  (event, level:number, message:string, line, sourceId)
- * Electron >=36: (event, details:{level:string, message:string, ...})
+ * Electron 36:   (event, details:{level:string, message:string})
+ * Electron 42:   (details: Event<WebContentsConsoleMessageEventParams>)
+ *                single object with {level, message} — positional
+ *                (details, level, message, line, sourceId) are deprecated
+ *                and now emit "(electron) 'console-message' arguments are
+ *                deprecated". The handler in main.js therefore passes only
+ *                the single event object.
  *
- * Accepting both is what keeps this from going dark on the next upgrade
- * the way it did on the last one. An unrecognised shape yields level
- * INFO and whatever text could be found, never a throw — a logger must
- * not be able to break the thing it observes.
+ * Accepting all keeps the mirror working across upgrades instead of
+ * silently going dark again. An unrecognised shape yields INFO and
+ * whatever text could be found, never a throw — a logger must not break
+ * the thing it observes.
  */
 function normalizeConsoleMessage(a, b) {
-  // Electron >= 36: a single details object.
+  // Electron 42: single Event<WebContentsConsoleMessageEventParams> as `a`.
   if (a && typeof a === "object" && typeof a.message === "string") {
     return {
       level: STRING_LEVELS[String(a.level || "").toLowerCase()] || LEVEL_INFO,
       message: a.message,
     };
   }
-  // Electron < 36: positional level + message.
+  // Electron 36 intermediate: (event, details) where details is `b`.
+  if (b && typeof b === "object" && typeof b.message === "string") {
+    return {
+      level: STRING_LEVELS[String(b.level || "").toLowerCase()] || LEVEL_INFO,
+      message: b.message,
+    };
+  }
+  // Electron <36: positional (level, message) — first arg is numeric level.
   const level =
     typeof a === "number"
       ? NUMERIC_LEVELS[a] || LEVEL_INFO

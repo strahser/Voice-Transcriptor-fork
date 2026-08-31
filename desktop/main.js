@@ -6881,14 +6881,15 @@ async function createWindow(options = {}) {
   // on, and enable renderer trace capture with
   // TRANSCRIPTOR_RENDERER_TRACE_LOGS=1 when diagnosing a packaged app.
   //
-  // Args: (event, level, message, line, sourceId)
-  //   level: 0=verbose, 1=info, 2=warning, 3=error
-  // Renderer console → support log. Policy and both Electron call
-  // signatures live in ./renderer-console.js (pure, unit-tested); this
-  // handler only forwards. See that module for why nothing the renderer
-  // logged had ever reached main.log.
-  win.webContents.on("console-message", (a, b) => {
-    const line = formatConsoleMirrorLine(a, b, MIRROR_RENDERER_TRACE_LOGS);
+  // Electron 42: 'console-message' is Event<WebContentsConsoleMessageEventParams>
+  // with {level, message, lineNumber, sourceId} inside the single event
+  // object. Deprecated positional (event, level, message, line, sourceId)
+  // would trigger "(electron) 'console-message' arguments are deprecated".
+  // Renderer console → support log. Policy and both signatures live in
+  // ./renderer-console.js (pure, unit-tested); this handler only forwards
+  // the single Event object.
+  win.webContents.on("console-message", (event) => {
+    const line = formatConsoleMirrorLine(event, undefined, MIRROR_RENDERER_TRACE_LOGS);
     if (line) appendMainLog(line);
   });
   win.webContents.on("render-process-gone", (_event, details) => {

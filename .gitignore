@@ -100,6 +100,8 @@ backend/.pytest_cache/
 **/.DS_Store
 **/__MACOSX/
 .claude/
+# Windows shortcuts — absolute paths, not portable
+*.lnk
 # Local agent/tool state — never part of a release checkout
 .mcode/
 # Per-version release staging folders (release-1.1.x/). Built
