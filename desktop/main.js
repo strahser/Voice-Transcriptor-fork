@@ -5199,7 +5199,7 @@ function runCommand(cmd, args, options = {}) {
       try {
         child.kill("SIGKILL");
       } catch { }
-      settleOnce({ ok: false, code: -1, stdout: finalStdout(), stderr: `${finalStderr()}\nTimed out` });
+      settleOnce({ ok: false, code: -1, timedOut: true, stdout: finalStdout(), stderr: `${finalStderr()}\nTimed out` });
     }, timeoutMs);
 
     child.stdout.on("data", (d) => {
@@ -5225,6 +5225,52 @@ function runCommand(cmd, args, options = {}) {
 function isBundledPythonRuntime(python) {
   const bundled = getBundledPythonPath();
   return !!bundled && path.resolve(python) === path.resolve(bundled);
+}
+
+// Is `python` running inside a virtualenv?
+//
+// Decides whether pip may be given `--user`: inside a venv pip refuses it
+// outright ("Can not perform a '--user' install. User site-packages are
+// not visible in this virtualenv"), so guessing wrong turns a recoverable
+// missing-dependency into a startup failure.
+//
+// The interpreter itself is the SSOT (`sys.prefix != sys.base_prefix` is
+// exactly the venv predicate, for any venv layout pip understands). Path
+// heuristics cannot be: `getAppVenvDir()` only names the venv WE create
+// (userData/.venv), while a dev checkout runs the REPO's .venv and users
+// may activate their own — both previously looked like a system Python.
+const _pythonVenvProbeCache = new Map();
+async function pythonRunsInVirtualenv(python, repoRoot) {
+  if (_pythonVenvProbeCache.has(python)) return _pythonVenvProbeCache.get(python);
+  const probe = await runCommand(
+    python,
+    ["-c", "import sys; print(1 if sys.prefix != sys.base_prefix else 0)"],
+    { cwd: repoRoot, timeoutMs: 15000, env: buildPythonEnv(python) }
+  );
+  const answer = (probe.stdout || "").trim();
+  let isVenv = null;
+  if (probe.ok && (answer === "1" || answer === "0")) {
+    isVenv = answer === "1";
+  } else {
+    // Probe inconclusive (timed out, killed, no stdout). Fall back to the
+    // layouts this app creates itself rather than assuming a system Python:
+    // a wrong "not a venv" answer would resurrect the --user failure above.
+    const candidates = [
+      getAppVenvDir(),
+      path.join(repoRoot, ".venv"),
+    ].map((dir) => path.resolve(dir));
+    const resolved = path.resolve(python);
+    const caseInsensitiveFs = process.platform === "win32" || process.platform === "darwin";
+    const normalize = (p) => (caseInsensitiveFs ? p.toLowerCase() : p);
+    const target = normalize(resolved);
+    isVenv = candidates.some((dir) => {
+      const prefix = normalize(dir);
+      return target === prefix || target.startsWith(prefix + path.sep);
+    });
+    appendMainLog(`[backend-runtime] venv probe inconclusive; path fallback says isVenv=${isVenv}`);
+  }
+  _pythonVenvProbeCache.set(python, isVenv);
+  return isVenv;
 }
 
 function getEngineSiteDir() {
@@ -5965,12 +6011,35 @@ function sweepEngineSiteLeftoversAtBoot() {
   }
 }
 
-async function ensureBackendRuntime(python, repoRoot) {
-  const importCheck = await runCommand(
+// Fast budget for the dependency probe, plus the budget used when that
+// first probe merely ran out of time. A cold Windows page cache makes
+// `import torch` (pulled in by faster_whisper) take well over 12 s on the
+// first launch after a reboot; treating that as "dependencies missing"
+// sent the app into a pip install it could not complete and killed launch.
+const PYTHON_IMPORT_CHECK_TIMEOUT_MS = 12000;
+const PYTHON_IMPORT_CHECK_COLD_TIMEOUT_MS = 180000;
+
+async function checkBackendRuntimeImports(python, repoRoot) {
+  const fast = await runCommand(
     python,
     ["-c", BACKEND_RUNTIME_IMPORT_CHECK],
-    { cwd: repoRoot, timeoutMs: 12000, env: buildPythonEnv(python) }
+    { cwd: repoRoot, timeoutMs: PYTHON_IMPORT_CHECK_TIMEOUT_MS, env: buildPythonEnv(python) }
   );
+  if (fast.ok || !fast.timedOut) return fast;
+  // Slow is not the same as absent: retry once with a cold-start budget
+  // before concluding anything about the environment. Costs nothing when
+  // the interpreter is healthy and no reinstall.
+  appendMainLog("[backend-runtime] import check timed out; retrying with cold-start budget");
+  setBackendBootStatus("Checking Python dependencies…");
+  return await runCommand(
+    python,
+    ["-c", BACKEND_RUNTIME_IMPORT_CHECK],
+    { cwd: repoRoot, timeoutMs: PYTHON_IMPORT_CHECK_COLD_TIMEOUT_MS, env: buildPythonEnv(python) }
+  );
+}
+
+async function ensureBackendRuntime(python, repoRoot) {
+  const importCheck = await checkBackendRuntimeImports(python, repoRoot);
 
   if (importCheck.ok) {
     // Engine installs are USER-initiated (Settings → Local models), never
@@ -5979,6 +6048,22 @@ async function ensureBackendRuntime(python, repoRoot) {
     // against the pinned bundle (BUG-46 heal, log-only).
     await reconcileEngineSiteAtBoot(python, repoRoot);
     return { ok: true };
+  }
+
+  // Importing stdlib + the pinned deps is not I/O the user can wait out
+  // forever: a second timeout means the interpreter itself is wedged
+  // (deadlocked .pyd, AV scanning every read). pip cannot fix that, so
+  // report it instead of starting a multi-minute install.
+  if (importCheck.timedOut) {
+    return {
+      ok: false,
+      details: [
+        "Python stopped responding while checking dependencies (timed out twice).",
+        "This usually means an antivirus is blocking the Python runtime.",
+        `python: ${python}`,
+        (importCheck.stderr || "").trim(),
+      ].filter(Boolean).join("\n"),
+    };
   }
 
   // If the selected Python IS the bundled runtime, deps are pre-installed
@@ -6037,29 +6122,15 @@ async function ensureBackendRuntime(python, repoRoot) {
 
   setBackendBootStatus("Installing dependencies (first launch)…");
 
-  // If Python is inside the app venv, install directly (no --user needed).
-  // Compare normalized absolute paths with a separator-boundary check
-  // so we can't (a) match a sibling directory by raw prefix
-  // ("/…/.venvold" matching "/…/.venv"), or (b) miss due to mixed
-  // separators after Python normalizes its own `sys.executable`.
-  // On case-insensitive filesystems (macOS APFS default, Windows NTFS)
-  // also compare case-insensitively so a user dir recorded in
-  // different case by the OS doesn't produce a false negative that
-  // scatters pip packages outside the app sandbox.
-  const venvDirNormalized = path.resolve(getAppVenvDir());
-  const pythonResolved = path.resolve(python);
-  const caseInsensitiveFs = process.platform === "win32" || process.platform === "darwin";
-  const pathEq = (a, b) => caseInsensitiveFs
-    ? a.toLowerCase() === b.toLowerCase()
-    : a === b;
-  const pathStartsWith = (a, prefix) => caseInsensitiveFs
-    ? a.toLowerCase().startsWith(prefix.toLowerCase())
-    : a.startsWith(prefix);
-  const isAppVenv =
-    pathEq(pythonResolved, venvDirNormalized) ||
-    pathStartsWith(pythonResolved, venvDirNormalized + path.sep);
+  // `--user` is only legal outside a venv (pip: "User site-packages are
+  // not visible in this virtualenv"). Ask the interpreter instead of
+  // comparing against getAppVenvDir(): the dev checkout runs the repo's
+  // .venv, which that path never matches — so every install attempt was
+  // issued with --user, failed instantly, and surfaced as a startup crash.
+  const isVenv = await pythonRunsInVirtualenv(python, repoRoot);
+  appendMainLog(`[backend-runtime] installing dependencies into isVenv=${isVenv}`);
   const pipArgs = ["-m", "pip", "install", "-r", requirementsPath];
-  if (!isAppVenv) {
+  if (!isVenv) {
     pipArgs.splice(3, 0, "--user");
   }
 
@@ -6075,7 +6146,7 @@ async function ensureBackendRuntime(python, repoRoot) {
   // The optional engine is NOT installed here: installs are user-initiated
   // from Settings (installGigaamEngine). Boot never blocks on pip.
 
-  if (!install.ok && !isAppVenv) {
+  if (!install.ok && !isVenv) {
     // Retry with --break-system-packages for macOS 14+ managed Python
     appendMainLog("[backend-runtime] retrying pip with --break-system-packages");
     const retry = await runCommand(
@@ -6106,11 +6177,7 @@ async function ensureBackendRuntime(python, repoRoot) {
 
   setBackendBootStatus("Verifying dependencies…");
 
-  const recheck = await runCommand(
-    python,
-    ["-c", BACKEND_RUNTIME_IMPORT_CHECK],
-    { cwd: repoRoot, timeoutMs: 12000, env: buildPythonEnv(python) }
-  );
+  const recheck = await checkBackendRuntimeImports(python, repoRoot);
 
   if (!recheck.ok) {
     return {
